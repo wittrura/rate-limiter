@@ -39,11 +39,9 @@ func (l *Limiter) Allow(at time.Time) bool {
 		return true
 	}
 
-	if at.Before(l.windowStart.Add(l.window)) {
-		if l.count < l.maxRequests {
-			l.count++
-			return true
-		}
+	if l.count < l.maxRequests {
+		l.count++
+		return true
 	}
 
 	return false
