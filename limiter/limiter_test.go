@@ -155,3 +155,132 @@ func TestNewLimiter_PanicsOnInvalidConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestRateLimiter_AllowsIndependentlyPerKey(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(2, time.Minute)
+	base := time.Date(2025, time.December, 9, 14, 0, 0, 0, time.UTC)
+
+	// keyA uses up its quota
+	if !rl.Allow("keyA", base) {
+		t.Fatalf("expected keyA first request allowed")
+	}
+	if !rl.Allow("keyA", base.Add(1*time.Second)) {
+		t.Fatalf("expected keyA second request allowed")
+	}
+	if rl.Allow("keyA", base.Add(2*time.Second)) {
+		t.Fatalf("expected keyA third request denied within window")
+	}
+
+	// keyB should be unaffected
+	if !rl.Allow("keyB", base.Add(2*time.Second)) {
+		t.Fatalf("expected keyB first request allowed even though keyA is limited")
+	}
+	if !rl.Allow("keyB", base.Add(3*time.Second)) {
+		t.Fatalf("expected keyB second request allowed")
+	}
+	if rl.Allow("keyB", base.Add(4*time.Second)) {
+		t.Fatalf("expected keyB third request denied within window")
+	}
+}
+
+func TestRateLimiter_ResetsPerKeyIndependently(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(1, 10*time.Second)
+	base := time.Date(2025, time.December, 9, 14, 30, 0, 0, time.UTC)
+
+	// Both keys allowed once in their initial window
+	if !rl.Allow("keyA", base) {
+		t.Fatalf("expected keyA first request allowed")
+	}
+	if !rl.Allow("keyB", base) {
+		t.Fatalf("expected keyB first request allowed")
+	}
+
+	// Second within same window denied for both
+	if rl.Allow("keyA", base.Add(5*time.Second)) {
+		t.Fatalf("expected keyA second request denied within window")
+	}
+	if rl.Allow("keyB", base.Add(5*time.Second)) {
+		t.Fatalf("expected keyB second request denied within window")
+	}
+
+	// Advance time: keyA resets, but keyB makes no calls until later — both should reset based on their own windowStart.
+	afterWindow := base.Add(10*time.Second + time.Nanosecond)
+
+	if !rl.Allow("keyA", afterWindow) {
+		t.Fatalf("expected keyA request after window allowed (reset)")
+	}
+	if !rl.Allow("keyB", afterWindow) {
+		t.Fatalf("expected keyB request after window allowed (reset)")
+	}
+}
+
+func TestRateLimiter_TreatsEmptyKeyAsAKey(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(1, time.Minute)
+	base := time.Date(2025, time.December, 9, 15, 0, 0, 0, time.UTC)
+
+	if !rl.Allow("", base) {
+		t.Fatalf("expected empty key first request allowed")
+	}
+	if rl.Allow("", base.Add(1*time.Second)) {
+		t.Fatalf("expected empty key second request denied within window")
+	}
+
+	// Another key should be independent
+	if !rl.Allow("x", base.Add(1*time.Second)) {
+		t.Fatalf("expected non-empty key allowed independently of empty key")
+	}
+}
+
+func TestNewRateLimiter_PanicsOnInvalidConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		maxRequests int
+		window      time.Duration
+	}{
+		{"zero maxRequests", 0, time.Minute},
+		{"negative maxRequests", -1, time.Minute},
+		{"zero window", 1, 0},
+		{"negative window", 1, -1 * time.Second},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected NewRateLimiter to panic for invalid config: %+v", tt)
+				}
+			}()
+
+			_ = NewRateLimiter(tt.maxRequests, tt.window)
+		})
+	}
+}
+
+func TestRateLimiter_CreatesStateLazilyForNewKeys(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(2, time.Minute)
+	base := time.Date(2025, time.December, 9, 15, 30, 0, 0, time.UTC)
+
+	// No prior setup for this key; first calls should work.
+	if !rl.Allow("brandNew", base) {
+		t.Fatalf("expected first request for new key allowed")
+	}
+	if !rl.Allow("brandNew", base.Add(1*time.Second)) {
+		t.Fatalf("expected second request for new key allowed")
+	}
+	if rl.Allow("brandNew", base.Add(2*time.Second)) {
+		t.Fatalf("expected third request for new key denied")
+	}
+}

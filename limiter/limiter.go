@@ -46,3 +46,35 @@ func (l *Limiter) Allow(at time.Time) bool {
 
 	return false
 }
+
+type RateLimiter struct {
+	maxRequests int
+	window      time.Duration
+
+	limiters map[string]*Limiter
+}
+
+func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
+	if maxRequests < 1 {
+		panic("cannot handle maxRequests less than 1")
+	}
+
+	if window <= time.Duration(0) {
+		panic("cannot handle zero or negative window")
+	}
+
+	return &RateLimiter{
+		maxRequests: maxRequests,
+		window:      window,
+		limiters:    make(map[string]*Limiter),
+	}
+}
+
+func (rl *RateLimiter) Allow(key string, at time.Time) bool {
+	limiter, ok := rl.limiters[key]
+	if !ok {
+		limiter = NewLimiter(rl.maxRequests, rl.window)
+		rl.limiters[key] = limiter
+	}
+	return limiter.Allow(at)
+}
