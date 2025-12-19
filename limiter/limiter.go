@@ -8,10 +8,11 @@ import (
 type Limiter struct {
 	maxRequests int
 	window      time.Duration
-
-	count int
+	count       int
 
 	windowStart time.Time
+
+	mu sync.Mutex
 }
 
 func NewLimiter(maxRequests int, window time.Duration) *Limiter {
@@ -30,6 +31,9 @@ func NewLimiter(maxRequests int, window time.Duration) *Limiter {
 }
 
 func (l *Limiter) Allow(at time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.windowStart.IsZero() {
 		l.windowStart = at
 		l.count = 1
