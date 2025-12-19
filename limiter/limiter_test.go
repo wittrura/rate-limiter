@@ -1,6 +1,7 @@
 package limiter_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -283,4 +284,116 @@ func TestRateLimiter_CreatesStateLazilyForNewKeys(t *testing.T) {
 	if rl.Allow("brandNew", base.Add(2*time.Second)) {
 		t.Fatalf("expected third request for new key denied")
 	}
+}
+
+func TestRateLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxRequests = 50
+		window      = time.Minute
+		goroutines  = 200
+	)
+
+	rl := NewRateLimiter(maxRequests, window)
+	at := time.Date(2025, time.December, 9, 16, 0, 0, 0, time.UTC)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	allowedCh := make(chan bool, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			allowedCh <- rl.Allow("same", at)
+		}()
+	}
+
+	wg.Wait()
+	close(allowedCh)
+
+	allowedCount := 0
+	for a := range allowedCh {
+		if a {
+			allowedCount++
+		}
+	}
+
+	if allowedCount != maxRequests {
+		t.Fatalf("expected exactly %d allowed, got %d", maxRequests, allowedCount)
+	}
+}
+
+func TestRateLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxRequests = 10
+		window      = time.Minute
+		keys        = 40
+		perKeyCalls = 50
+	)
+
+	rl := NewRateLimiter(maxRequests, window)
+	at := time.Date(2025, time.December, 9, 16, 30, 0, 0, time.UTC)
+
+	var wg sync.WaitGroup
+	wg.Add(keys * perKeyCalls)
+
+	type result struct {
+		key     string
+		allowed bool
+	}
+	results := make(chan result, keys*perKeyCalls)
+
+	for k := 0; k < keys; k++ {
+		key := "key-" + string(rune('A'+k)) // deterministic, simple
+		for i := 0; i < perKeyCalls; i++ {
+			go func(key string) {
+				defer wg.Done()
+				results <- result{key: key, allowed: rl.Allow(key, at)}
+			}(key)
+		}
+	}
+
+	wg.Wait()
+	close(results)
+
+	allowedPerKey := make(map[string]int)
+	for r := range results {
+		if r.allowed {
+			allowedPerKey[r.key]++
+		}
+	}
+
+	// Each key should allow exactly maxRequests and deny the rest.
+	for k := 0; k < keys; k++ {
+		key := "key-" + string(rune('A'+k))
+		if allowedPerKey[key] != maxRequests {
+			t.Fatalf("expected key %q to allow %d, got %d", key, maxRequests, allowedPerKey[key])
+		}
+	}
+}
+
+func TestRateLimiter_ConcurrentLazyInit_DoesNotPanicOrRace(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(1, time.Minute)
+	at := time.Date(2025, time.December, 9, 17, 0, 0, 0, time.UTC)
+
+	const goroutines = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	// All goroutines contend on a brand new key at once.
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_ = rl.Allow("brand-new-key", at)
+		}()
+	}
+
+	wg.Wait()
 }

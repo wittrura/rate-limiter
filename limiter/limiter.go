@@ -1,6 +1,9 @@
 package limiter
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 type Limiter struct {
 	maxRequests int
@@ -52,6 +55,8 @@ type RateLimiter struct {
 	window      time.Duration
 
 	limiters map[string]*Limiter
+
+	mu sync.Mutex
 }
 
 func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
@@ -71,6 +76,9 @@ func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
 }
 
 func (rl *RateLimiter) Allow(key string, at time.Time) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
 	limiter, ok := rl.limiters[key]
 	if !ok {
 		limiter = NewLimiter(rl.maxRequests, rl.window)
