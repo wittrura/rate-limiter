@@ -90,3 +90,54 @@ func (rl *RateLimiter) Allow(key string, at time.Time) bool {
 	}
 	return limiter.Allow(at)
 }
+
+type TokenBucket struct {
+	tokens      int
+	capacity    int
+	refillEvery time.Duration
+
+	lastRefill time.Time
+}
+
+func NewTokenBucket(maxTokens int, refillEvery time.Duration) *TokenBucket {
+	if maxTokens < 1 {
+		panic("cannot handle maxTokens less than 1")
+	}
+
+	if refillEvery <= time.Duration(0) {
+		panic("cannot handle zero or negative refillEvery")
+	}
+
+	return &TokenBucket{
+		tokens:      maxTokens,
+		capacity:    maxTokens,
+		refillEvery: refillEvery,
+	}
+}
+
+func (tb *TokenBucket) Allow(at time.Time) bool {
+	if tb.lastRefill.IsZero() {
+		tb.lastRefill = at
+	}
+
+	var intervals int
+	if at.After(tb.lastRefill) {
+		sinceLastRefill := at.Sub(tb.lastRefill)
+		intervals = int(sinceLastRefill / tb.refillEvery)
+	}
+
+	if intervals > 0 {
+		// add one token for each interval but cap at capacity
+		tb.tokens = min(tb.capacity, tb.tokens+intervals)
+
+		advance := time.Duration(intervals) * tb.refillEvery
+		tb.lastRefill = tb.lastRefill.Add(advance)
+	}
+
+	if tb.tokens > 0 {
+		tb.tokens--
+		return true
+	}
+
+	return false
+}

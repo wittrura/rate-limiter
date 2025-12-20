@@ -303,7 +303,7 @@ func TestRateLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
 
 	allowedCh := make(chan bool, goroutines)
 
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
 			allowedCh <- rl.Allow("same", at)
@@ -347,7 +347,7 @@ func TestRateLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
 	}
 	results := make(chan result, keys*perKeyCalls)
 
-	for k := 0; k < keys; k++ {
+	for k := range keys {
 		key := "key-" + string(rune('A'+k)) // deterministic, simple
 		for i := 0; i < perKeyCalls; i++ {
 			go func(key string) {
@@ -388,7 +388,7 @@ func TestRateLimiter_ConcurrentLazyInit_DoesNotPanicOrRace(t *testing.T) {
 	wg.Add(goroutines)
 
 	// All goroutines contend on a brand new key at once.
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
 			_ = rl.Allow("brand-new-key", at)
@@ -396,4 +396,152 @@ func TestRateLimiter_ConcurrentLazyInit_DoesNotPanicOrRace(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestTokenBucket_StartsFull_AllowsUpToCapacityImmediately(t *testing.T) {
+	t.Parallel()
+
+	tb := NewTokenBucket(3, time.Second)
+	base := time.Date(2025, time.December, 9, 18, 0, 0, 0, time.UTC)
+
+	for i := range 3 {
+		if !tb.Allow(base) {
+			t.Fatalf("expected call %d to be allowed at start (bucket starts full)", i+1)
+		}
+	}
+
+	if tb.Allow(base) {
+		t.Fatalf("expected 4th call to be denied (capacity exhausted)")
+	}
+}
+
+func TestTokenBucket_RefillsOneTokenPerInterval(t *testing.T) {
+	t.Parallel()
+
+	tb := NewTokenBucket(2, 10*time.Second)
+	base := time.Date(2025, time.December, 9, 18, 10, 0, 0, time.UTC)
+
+	// Drain bucket (2 tokens).
+	if !tb.Allow(base) {
+		t.Fatalf("expected first call allowed")
+	}
+	if !tb.Allow(base) {
+		t.Fatalf("expected second call allowed")
+	}
+	if tb.Allow(base) {
+		t.Fatalf("expected third call denied (bucket empty)")
+	}
+
+	// Not enough time for a refill.
+	if tb.Allow(base.Add(9 * time.Second)) {
+		t.Fatalf("expected denied before refill interval elapses")
+	}
+
+	// Exactly one interval later: 1 token should be available.
+	if !tb.Allow(base.Add(10 * time.Second)) {
+		t.Fatalf("expected allowed after one refill interval")
+	}
+
+	// Consumed the refilled token.
+	if tb.Allow(base.Add(10 * time.Second)) {
+		t.Fatalf("expected denied after consuming the single refilled token")
+	}
+}
+
+func TestTokenBucket_RefillAccumulatesOverMultipleIntervalsUpToCapacity(t *testing.T) {
+	t.Parallel()
+
+	tb := NewTokenBucket(5, 2*time.Second)
+	base := time.Date(2025, time.December, 9, 18, 20, 0, 0, time.UTC)
+
+	// Drain all 5 tokens.
+	for i := range 5 {
+		if !tb.Allow(base) {
+			t.Fatalf("expected drain call %d allowed", i+1)
+		}
+	}
+	if tb.Allow(base) {
+		t.Fatalf("expected denied after draining capacity")
+	}
+
+	// After 7 seconds with a 2s refill interval, we should have refilled floor(7/2)=3 tokens.
+	refillTime := base.Add(7 * time.Second)
+
+	for i := range 3 {
+		if !tb.Allow(refillTime) {
+			t.Fatalf("expected refilled token %d to be available", i+1)
+		}
+	}
+
+	if tb.Allow(refillTime) {
+		t.Fatalf("expected denied after consuming the 3 refilled tokens")
+	}
+
+	// After a long time, bucket should cap at capacity, not exceed it.
+	longLater := base.Add(60 * time.Second)
+
+	for i := range 5 {
+		if !tb.Allow(longLater) {
+			t.Fatalf("expected token %d allowed after long refill (capped at capacity)", i+1)
+		}
+	}
+	if tb.Allow(longLater) {
+		t.Fatalf("expected denied after consuming capped capacity")
+	}
+}
+
+func TestTokenBucket_DoesNotGoBackwardInTime(t *testing.T) {
+	t.Parallel()
+
+	tb := NewTokenBucket(2, 10*time.Second)
+	base := time.Date(2025, time.December, 9, 18, 30, 0, 0, time.UTC)
+
+	// Drain 2 tokens.
+	if !tb.Allow(base) || !tb.Allow(base) {
+		t.Fatalf("expected initial tokens allowed")
+	}
+	if tb.Allow(base) {
+		t.Fatalf("expected denied when empty")
+	}
+
+	// If time goes backward, we should NOT "negative refill" or break state.
+	// It should behave as if no refill happened.
+	if tb.Allow(base.Add(-5 * time.Second)) {
+		t.Fatalf("expected denied when time goes backward and bucket is empty")
+	}
+
+	// Normal forward time refill still works.
+	if !tb.Allow(base.Add(10 * time.Second)) {
+		t.Fatalf("expected allowed after one refill interval")
+	}
+}
+
+func TestNewTokenBucket_PanicsOnInvalidConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		maxTokens   int
+		refillEvery time.Duration
+	}{
+		{"zero maxTokens", 0, time.Second},
+		{"negative maxTokens", -1, time.Second},
+		{"zero refillEvery", 1, 0},
+		{"negative refillEvery", 1, -1 * time.Second},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected NewTokenBucket to panic for invalid config: %+v", tt)
+				}
+			}()
+
+			_ = NewTokenBucket(tt.maxTokens, tt.refillEvery)
+		})
+	}
 }
