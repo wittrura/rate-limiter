@@ -2,6 +2,7 @@ package limiter_test
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -543,5 +544,179 @@ func TestNewTokenBucket_PanicsOnInvalidConfig(t *testing.T) {
 
 			_ = NewTokenBucket(tt.maxTokens, tt.refillEvery)
 		})
+	}
+}
+
+type fakeStrategy struct {
+	remaining int64
+}
+
+func newFakeStrategy(allows int) *fakeStrategy {
+	return &fakeStrategy{remaining: int64(allows)}
+}
+
+func (s *fakeStrategy) Allow(_ time.Time) bool {
+	for {
+		cur := atomic.LoadInt64(&s.remaining)
+		if cur <= 0 {
+			return false
+		}
+
+		if atomic.CompareAndSwapInt64(&s.remaining, cur, cur-1) {
+			return true
+		}
+	}
+}
+
+func TestNewKeyedLimiter_PanicsOnNilFactory(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected NewKeyedLimiter to panic on nil factory")
+		}
+	}()
+
+	_ = NewKeyedLimiter(nil)
+}
+
+func TestKeyedLimiter_LazilyCreatesStrategyPerNewKey(t *testing.T) {
+	t.Parallel()
+
+	var created int32
+	factory := func() Strategy {
+		atomic.AddInt32(&created, 1)
+		return newFakeStrategy(1)
+	}
+
+	kl := NewKeyedLimiter(factory)
+	at := time.Date(2025, time.December, 9, 19, 0, 0, 0, time.UTC)
+
+	// No keys touched yet.
+	if atomic.LoadInt32(&created) != 0 {
+		t.Fatalf("expected no strategies created before first Allow call")
+	}
+
+	if !kl.Allow("a", at) {
+		t.Fatalf("expected key a allowed (fresh strategy)")
+	}
+	if atomic.LoadInt32(&created) != 1 {
+		t.Fatalf("expected 1 strategy created after first new key")
+	}
+
+	if !kl.Allow("b", at) {
+		t.Fatalf("expected key b allowed (fresh strategy)")
+	}
+	if atomic.LoadInt32(&created) != 2 {
+		t.Fatalf("expected 2 strategies created after second new key")
+	}
+}
+
+func TestKeyedLimiter_ReusesSameStrategyForSameKey(t *testing.T) {
+	t.Parallel()
+
+	var created int32
+	factory := func() Strategy {
+		atomic.AddInt32(&created, 1)
+		return newFakeStrategy(2)
+	}
+
+	kl := NewKeyedLimiter(factory)
+	at := time.Date(2025, time.December, 9, 19, 10, 0, 0, time.UTC)
+
+	// Same key should not create new strategy instances.
+	if !kl.Allow("same", at) {
+		t.Fatalf("expected first call allowed")
+	}
+	if !kl.Allow("same", at) {
+		t.Fatalf("expected second call allowed")
+	}
+	if kl.Allow("same", at) {
+		t.Fatalf("expected third call denied")
+	}
+
+	if atomic.LoadInt32(&created) != 1 {
+		t.Fatalf("expected exactly 1 strategy instance created for the key, got %d", atomic.LoadInt32(&created))
+	}
+}
+
+func TestKeyedLimiter_DifferentKeysUseIndependentStrategyState(t *testing.T) {
+	t.Parallel()
+
+	factory := func() Strategy {
+		// Each key gets a strategy that allows exactly 1 request.
+		return newFakeStrategy(1)
+	}
+
+	kl := NewKeyedLimiter(factory)
+	at := time.Date(2025, time.December, 9, 19, 20, 0, 0, time.UTC)
+
+	// keyA
+	if !kl.Allow("keyA", at) {
+		t.Fatalf("expected keyA first allowed")
+	}
+	if kl.Allow("keyA", at) {
+		t.Fatalf("expected keyA second denied")
+	}
+
+	// keyB should be independent
+	if !kl.Allow("keyB", at) {
+		t.Fatalf("expected keyB first allowed")
+	}
+	if kl.Allow("keyB", at) {
+		t.Fatalf("expected keyB second denied")
+	}
+}
+
+func TestKeyedLimiter_TreatsEmptyKeyAsAKey(t *testing.T) {
+	t.Parallel()
+
+	factory := func() Strategy {
+		return newFakeStrategy(1)
+	}
+
+	kl := NewKeyedLimiter(factory)
+	at := time.Date(2025, time.December, 9, 19, 30, 0, 0, time.UTC)
+
+	if !kl.Allow("", at) {
+		t.Fatalf("expected empty key first allowed")
+	}
+	if kl.Allow("", at) {
+		t.Fatalf("expected empty key second denied")
+	}
+
+	// Another key should be independent
+	if !kl.Allow("x", at) {
+		t.Fatalf("expected non-empty key allowed independently of empty key")
+	}
+}
+
+func TestKeyedLimiter_ConcurrentFirstUseSameKey_CreatesOnlyOneStrategy(t *testing.T) {
+	t.Parallel()
+
+	var created int32
+	factory := func() Strategy {
+		atomic.AddInt32(&created, 1)
+		return newFakeStrategy(1000)
+	}
+
+	kl := NewKeyedLimiter(factory)
+	at := time.Date(2025, time.December, 9, 19, 40, 0, 0, time.UTC)
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_ = kl.Allow("brand-new", at)
+		}()
+	}
+
+	wg.Wait()
+
+	if atomic.LoadInt32(&created) != 1 {
+		t.Fatalf("expected exactly 1 strategy created under concurrent first use, got %d", atomic.LoadInt32(&created))
 	}
 }

@@ -141,3 +141,41 @@ func (tb *TokenBucket) Allow(at time.Time) bool {
 
 	return false
 }
+
+type Strategy interface {
+	Allow(at time.Time) bool
+}
+
+type StrategyFactory func() Strategy
+
+type KeyedLimiter struct {
+	strategies map[string]Strategy
+	factory    StrategyFactory
+
+	mu sync.Mutex
+}
+
+func NewKeyedLimiter(factory StrategyFactory) *KeyedLimiter {
+	if factory == nil {
+		panic("limiter requires non-nil strategy")
+	}
+
+	return &KeyedLimiter{
+		factory:    factory,
+		strategies: make(map[string]Strategy),
+	}
+}
+
+func (kl *KeyedLimiter) Allow(key string, at time.Time) bool {
+	kl.mu.Lock()
+	defer kl.mu.Unlock()
+
+	var strategy Strategy
+	strategy, ok := kl.strategies[key]
+	if !ok {
+		strategy = kl.factory()
+		kl.strategies[key] = strategy
+	}
+
+	return strategy.Allow(at)
+}
