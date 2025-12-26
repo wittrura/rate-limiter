@@ -179,3 +179,45 @@ func (kl *KeyedLimiter) Allow(key string, at time.Time) bool {
 
 	return strategy.Allow(at)
 }
+
+type Info struct {
+	Limit     int
+	Remaining int
+	ResetAt   time.Time
+}
+
+type StrategyWithInfo interface {
+	Allow(at time.Time) (allowed bool, info Info)
+}
+
+type KeyedLimiterWithInfo struct {
+	strategies map[string]StrategyWithInfo
+	factory    func() StrategyWithInfo
+
+	mu sync.Mutex
+}
+
+func NewKeyedLimiterWithInfo(factory func() StrategyWithInfo) *KeyedLimiterWithInfo {
+	if factory == nil {
+		panic("limiter requires non-nil strategy")
+	}
+
+	return &KeyedLimiterWithInfo{
+		factory:    factory,
+		strategies: make(map[string]StrategyWithInfo),
+	}
+}
+
+func (kl *KeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
+	kl.mu.Lock()
+	defer kl.mu.Unlock()
+
+	var strategy StrategyWithInfo
+	strategy, ok := kl.strategies[key]
+	if !ok {
+		strategy = kl.factory()
+		kl.strategies[key] = strategy
+	}
+
+	return strategy.Allow(at)
+}
