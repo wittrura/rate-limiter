@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -194,10 +195,19 @@ type StrategyWithInfo interface {
 	Allow(at time.Time) (allowed bool, info Info)
 }
 
+type entry struct {
+	strategy   StrategyWithInfo
+	lastAccess time.Time
+}
+
 // keyed dispatcher WITH INFO - default
 type KeyedLimiterWithInfo struct {
-	strategies map[string]StrategyWithInfo
-	factory    func() StrategyWithInfo
+	entries map[string]entry
+	factory func() StrategyWithInfo
+
+	cleanupTicker *time.Ticker
+	cleanupCancel context.CancelFunc
+	isClosed      bool
 
 	mu sync.Mutex
 }
@@ -208,23 +218,86 @@ func NewKeyedLimiterWithInfo(factory func() StrategyWithInfo) *KeyedLimiterWithI
 	}
 
 	return &KeyedLimiterWithInfo{
-		factory:    factory,
-		strategies: make(map[string]StrategyWithInfo),
+		factory: factory,
+		entries: make(map[string]entry),
 	}
+}
+
+type CleanupConfig struct {
+	IdleTTL      time.Duration
+	CleanupEvery time.Duration
+}
+
+func NewKeyedLimiterWithInfoAndCleanup(factory func() StrategyWithInfo, cfg CleanupConfig, now func() time.Time) *KeyedLimiterWithInfo {
+	if factory == nil {
+		panic("limiter requires non-nil strategy")
+	}
+
+	if cfg.IdleTTL <= 0 {
+		panic("cleanup requires IdleTTL > 0")
+	}
+	if cfg.CleanupEvery <= 0 {
+		panic("cleanup requires CleanupEvery > 0")
+	}
+	if now == nil {
+		panic("cleanup requires non-nil now() parameter")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(cfg.CleanupEvery)
+
+	limiter := &KeyedLimiterWithInfo{
+		factory:       factory,
+		entries:       make(map[string]entry),
+		cleanupTicker: ticker,
+		cleanupCancel: cancel,
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				limiter.mu.Lock()
+				cutoff := now().Add(-cfg.IdleTTL)
+				for key, entry := range limiter.entries {
+					if entry.lastAccess.Before(cutoff) {
+						delete(limiter.entries, key)
+					}
+				}
+				limiter.mu.Unlock()
+			}
+		}
+	}()
+
+	return limiter
 }
 
 func (kl *KeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
 	kl.mu.Lock()
 	defer kl.mu.Unlock()
 
-	var strategy StrategyWithInfo
-	strategy, ok := kl.strategies[key]
+	e, ok := kl.entries[key]
 	if !ok {
-		strategy = kl.factory()
-		kl.strategies[key] = strategy
+		e = entry{strategy: kl.factory()}
 	}
+	e.lastAccess = at
+	kl.entries[key] = e
 
-	return strategy.Allow(at)
+	return e.strategy.Allow(at)
+}
+
+func (kl *KeyedLimiterWithInfo) Close() {
+	kl.mu.Lock()
+	defer kl.mu.Unlock()
+
+	if kl.isClosed {
+		return
+	}
+	kl.cleanupCancel()
+	kl.cleanupTicker.Stop()
+	kl.isClosed = true
 }
 
 type FixedWindowStrategy struct {

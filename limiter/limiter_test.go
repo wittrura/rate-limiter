@@ -930,3 +930,216 @@ func TestKeyedLimiterWithInfo_ConcurrentFirstUseSameKey_CreatesOnlyOneStrategy(t
 		t.Fatalf("expected exactly 1 strategy created under concurrent first use, got %d", atomic.LoadInt32(&created))
 	}
 }
+
+type trackingStrategy struct{}
+
+func (trackingStrategy) Allow(_ time.Time) (bool, Info) {
+	return true, Info{
+		Limit:     1,
+		Remaining: 0,
+		ResetAt:   time.Unix(0, 0),
+	}
+}
+
+func TestNewKeyedLimiterWithInfoAndCleanup_PanicsOnInvalidArgs(t *testing.T) {
+	t.Parallel()
+
+	validFactory := func() StrategyWithInfo { return trackingStrategy{} }
+	validNow := func() time.Time { return time.Unix(0, 0) }
+
+	t.Run("nil factory", func(t *testing.T) {
+		t.Parallel()
+
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic for nil factory")
+			}
+		}()
+
+		_ = NewKeyedLimiterWithInfoAndCleanup(nil, CleanupConfig{
+			IdleTTL:      time.Second,
+			CleanupEvery: 10 * time.Millisecond,
+		}, validNow)
+	})
+
+	t.Run("nil now", func(t *testing.T) {
+		t.Parallel()
+
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic for nil now")
+			}
+		}()
+
+		_ = NewKeyedLimiterWithInfoAndCleanup(validFactory, CleanupConfig{
+			IdleTTL:      time.Second,
+			CleanupEvery: 10 * time.Millisecond,
+		}, nil)
+	})
+
+	tests := []struct {
+		name string
+		cfg  CleanupConfig
+	}{
+		{"zero IdleTTL", CleanupConfig{IdleTTL: 0, CleanupEvery: 10 * time.Millisecond}},
+		{"negative IdleTTL", CleanupConfig{IdleTTL: -1 * time.Second, CleanupEvery: 10 * time.Millisecond}},
+		{"zero CleanupEvery", CleanupConfig{IdleTTL: time.Second, CleanupEvery: 0}},
+		{"negative CleanupEvery", CleanupConfig{IdleTTL: time.Second, CleanupEvery: -1 * time.Millisecond}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected panic for invalid config: %+v", tt.cfg)
+				}
+			}()
+
+			_ = NewKeyedLimiterWithInfoAndCleanup(validFactory, tt.cfg, validNow)
+		})
+	}
+}
+
+func TestKeyedLimiterWithInfo_CleansUpIdleKeys_RecreatesAfterEviction(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2025, time.December, 9, 23, 0, 0, 0, time.UTC)
+	var currentUnix atomic.Int64
+	currentUnix.Store(start.UnixNano())
+	cur := func() time.Time { return time.Unix(0, currentUnix.Load()) }
+	now := func() time.Time { return cur() }
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	cfg := CleanupConfig{
+		IdleTTL:      50 * time.Millisecond,
+		CleanupEvery: 10 * time.Millisecond,
+	}
+
+	kl := NewKeyedLimiterWithInfoAndCleanup(factory, cfg, now)
+	t.Cleanup(func() { kl.Close() })
+
+	// First use creates strategy for key.
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected 1 strategy created, got %d", got)
+	}
+
+	// Advance our logical clock beyond IdleTTL.
+	currentUnix.Add((200 * time.Millisecond).Nanoseconds())
+
+	// Give cleanup loop time to run at least once.
+	time.Sleep(50 * time.Millisecond)
+
+	// If key was evicted, next Allow should recreate.
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed after eviction")
+	}
+	if got := atomic.LoadInt32(&created); got != 2 {
+		t.Fatalf("expected strategy to be recreated after eviction; created=%d", got)
+	}
+}
+
+func TestKeyedLimiterWithInfo_CloseStopsCleanupAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2025, time.December, 9, 23, 10, 0, 0, time.UTC)
+	var currentUnix atomic.Int64
+	currentUnix.Store(start.UnixNano())
+	cur := func() time.Time { return time.Unix(0, currentUnix.Load()) }
+	now := func() time.Time { return cur() }
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	cfg := CleanupConfig{
+		IdleTTL:      50 * time.Millisecond,
+		CleanupEvery: 10 * time.Millisecond,
+	}
+
+	kl := NewKeyedLimiterWithInfoAndCleanup(factory, cfg, now)
+
+	// Create key
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected 1 strategy created, got %d", got)
+	}
+
+	// Close should be safe and stop cleanup; call twice to ensure idempotence.
+	kl.Close()
+	kl.Close()
+
+	// Advance time beyond TTL.
+	currentUnix.Add((200 * time.Millisecond).Nanoseconds())
+
+	// Wait longer than CleanupEvery to ensure cleanup WOULD have run if enabled.
+	time.Sleep(50 * time.Millisecond)
+
+	// If cleanup is stopped, the original entry should still exist, so factory should NOT be called again.
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected no recreation after Close; created=%d", got)
+	}
+}
+
+func TestKeyedLimiterWithInfo_CleanupDoesNotEvictRecentlyUsedKey(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2025, time.December, 9, 23, 20, 0, 0, time.UTC)
+	var currentUnix atomic.Int64
+	currentUnix.Store(start.UnixNano())
+	cur := func() time.Time { return time.Unix(0, currentUnix.Load()) }
+	now := func() time.Time { return cur() }
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	cfg := CleanupConfig{
+		IdleTTL:      80 * time.Millisecond,
+		CleanupEvery: 10 * time.Millisecond,
+	}
+
+	kl := NewKeyedLimiterWithInfoAndCleanup(factory, cfg, now)
+	t.Cleanup(func() { kl.Close() })
+
+	// Create key
+	if allowed, _ := kl.Allow("hot", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected 1 strategy created, got %d", got)
+	}
+
+	// Keep using the key, updating last-access time.
+	for range 3 {
+		currentUnix.Add((40 * time.Millisecond).Nanoseconds()) // less than IdleTTL
+		if allowed, _ := kl.Allow("hot", cur()); !allowed {
+			t.Fatalf("expected allowed")
+		}
+		time.Sleep(15 * time.Millisecond) // allow cleanup ticks
+	}
+
+	// If it was not evicted, created should still be 1.
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected key not evicted while active; created=%d", got)
+	}
+}
