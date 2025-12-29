@@ -9,12 +9,12 @@ import (
 	. "example.com/rate-limiter/limiter"
 )
 
-func TestLimiter_AllowsUpToMaxInWindow(t *testing.T) {
+func TestFixedWindow_AllowsUpToMaxInWindow(t *testing.T) {
 	t.Parallel()
 
 	maxRequests := 3
 	window := 1 * time.Minute
-	limiter := NewLimiter(maxRequests, window)
+	limiter := NewFixedWindow(maxRequests, window)
 
 	baseTime := time.Date(2025, time.December, 9, 10, 0, 0, 0, time.UTC)
 
@@ -26,12 +26,12 @@ func TestLimiter_AllowsUpToMaxInWindow(t *testing.T) {
 	}
 }
 
-func TestLimiter_BlocksWhenOverLimitWithinWindow(t *testing.T) {
+func TestFixedWindow_BlocksWhenOverLimitWithinWindow(t *testing.T) {
 	t.Parallel()
 
 	maxRequests := 3
 	window := 1 * time.Minute
-	limiter := NewLimiter(maxRequests, window)
+	limiter := NewFixedWindow(maxRequests, window)
 
 	baseTime := time.Date(2025, time.December, 9, 11, 0, 0, 0, time.UTC)
 
@@ -50,12 +50,12 @@ func TestLimiter_BlocksWhenOverLimitWithinWindow(t *testing.T) {
 	}
 }
 
-func TestLimiter_ResetsAfterWindowPasses(t *testing.T) {
+func TestFixedWindow_ResetsAfterWindowPasses(t *testing.T) {
 	t.Parallel()
 
 	maxRequests := 2
 	window := 1 * time.Minute
-	limiter := NewLimiter(maxRequests, window)
+	limiter := NewFixedWindow(maxRequests, window)
 
 	baseTime := time.Date(2025, time.December, 9, 12, 0, 0, 0, time.UTC)
 
@@ -91,14 +91,14 @@ func TestLimiter_ResetsAfterWindowPasses(t *testing.T) {
 	}
 }
 
-func TestLimiter_WithDifferentConfigsIndependently(t *testing.T) {
+func TestFixedWindow_WithDifferentConfigsIndependently(t *testing.T) {
 	t.Parallel()
 
 	baseTime := time.Date(2025, time.December, 9, 13, 0, 0, 0, time.UTC)
 
 	// This test assumes each limiter instance tracks state independently.
-	limiterFast := NewLimiter(1, 10*time.Second) // 1 request per 10s
-	limiterSlow := NewLimiter(2, time.Minute)    // 2 requests per 60s
+	limiterFast := NewFixedWindow(1, 10*time.Second) // 1 request per 10s
+	limiterSlow := NewFixedWindow(2, time.Minute)    // 2 requests per 60s
 
 	// First call on both should be allowed.
 	if !limiterFast.Allow(baseTime) {
@@ -129,7 +129,7 @@ func TestLimiter_WithDifferentConfigsIndependently(t *testing.T) {
 	}
 }
 
-func TestNewLimiter_PanicsOnInvalidConfig(t *testing.T) {
+func TestNewFixedWindow_PanicsOnInvalidConfig(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -153,15 +153,15 @@ func TestNewLimiter_PanicsOnInvalidConfig(t *testing.T) {
 				}
 			}()
 
-			_ = NewLimiter(tt.maxRequests, tt.window)
+			_ = NewFixedWindow(tt.maxRequests, tt.window)
 		})
 	}
 }
 
-func TestRateLimiter_AllowsIndependentlyPerKey(t *testing.T) {
+func TestFixedWindowLimiter_AllowsIndependentlyPerKey(t *testing.T) {
 	t.Parallel()
 
-	rl := NewRateLimiter(2, time.Minute)
+	rl := NewFixedWindowLimiter(2, time.Minute)
 	base := time.Date(2025, time.December, 9, 14, 0, 0, 0, time.UTC)
 
 	// keyA uses up its quota
@@ -187,10 +187,10 @@ func TestRateLimiter_AllowsIndependentlyPerKey(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_ResetsPerKeyIndependently(t *testing.T) {
+func TestFixedWindowLimiter_ResetsPerKeyIndependently(t *testing.T) {
 	t.Parallel()
 
-	rl := NewRateLimiter(1, 10*time.Second)
+	rl := NewFixedWindowLimiter(1, 10*time.Second)
 	base := time.Date(2025, time.December, 9, 14, 30, 0, 0, time.UTC)
 
 	// Both keys allowed once in their initial window
@@ -220,10 +220,10 @@ func TestRateLimiter_ResetsPerKeyIndependently(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_TreatsEmptyKeyAsAKey(t *testing.T) {
+func TestFixedWindowLimiter_TreatsEmptyKeyAsAKey(t *testing.T) {
 	t.Parallel()
 
-	rl := NewRateLimiter(1, time.Minute)
+	rl := NewFixedWindowLimiter(1, time.Minute)
 	base := time.Date(2025, time.December, 9, 15, 0, 0, 0, time.UTC)
 
 	if !rl.Allow("", base) {
@@ -239,7 +239,7 @@ func TestRateLimiter_TreatsEmptyKeyAsAKey(t *testing.T) {
 	}
 }
 
-func TestNewRateLimiter_PanicsOnInvalidConfig(t *testing.T) {
+func TestNewFixedWindowLimiter_PanicsOnInvalidConfig(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -260,19 +260,19 @@ func TestNewRateLimiter_PanicsOnInvalidConfig(t *testing.T) {
 
 			defer func() {
 				if r := recover(); r == nil {
-					t.Fatalf("expected NewRateLimiter to panic for invalid config: %+v", tt)
+					t.Fatalf("expected NewFixedWindowLimiter to panic for invalid config: %+v", tt)
 				}
 			}()
 
-			_ = NewRateLimiter(tt.maxRequests, tt.window)
+			_ = NewFixedWindowLimiter(tt.maxRequests, tt.window)
 		})
 	}
 }
 
-func TestRateLimiter_CreatesStateLazilyForNewKeys(t *testing.T) {
+func TestFixedWindowLimiter_CreatesStateLazilyForNewKeys(t *testing.T) {
 	t.Parallel()
 
-	rl := NewRateLimiter(2, time.Minute)
+	rl := NewFixedWindowLimiter(2, time.Minute)
 	base := time.Date(2025, time.December, 9, 15, 30, 0, 0, time.UTC)
 
 	// No prior setup for this key; first calls should work.
@@ -287,7 +287,7 @@ func TestRateLimiter_CreatesStateLazilyForNewKeys(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
+func TestFixedWindowLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -296,7 +296,7 @@ func TestRateLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
 		goroutines  = 200
 	)
 
-	rl := NewRateLimiter(maxRequests, window)
+	rl := NewFixedWindowLimiter(maxRequests, window)
 	at := time.Date(2025, time.December, 9, 16, 0, 0, 0, time.UTC)
 
 	var wg sync.WaitGroup
@@ -326,7 +326,7 @@ func TestRateLimiter_ConcurrentSameKey_AllowsAtMostMax(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
+func TestFixedWindowLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -336,7 +336,7 @@ func TestRateLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
 		perKeyCalls = 50
 	)
 
-	rl := NewRateLimiter(maxRequests, window)
+	rl := NewFixedWindowLimiter(maxRequests, window)
 	at := time.Date(2025, time.December, 9, 16, 30, 0, 0, time.UTC)
 
 	var wg sync.WaitGroup
@@ -377,10 +377,10 @@ func TestRateLimiter_ConcurrentDifferentKeys_DoNotInterfere(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_ConcurrentLazyInit_DoesNotPanicOrRace(t *testing.T) {
+func TestFixedWindowLimiter_ConcurrentLazyInit_DoesNotPanicOrRace(t *testing.T) {
 	t.Parallel()
 
-	rl := NewRateLimiter(1, time.Minute)
+	rl := NewFixedWindowLimiter(1, time.Minute)
 	at := time.Date(2025, time.December, 9, 17, 0, 0, 0, time.UTC)
 
 	const goroutines = 100

@@ -5,7 +5,8 @@ import (
 	"time"
 )
 
-type Limiter struct {
+// single-key algorithm
+type FixedWindow struct {
 	maxRequests int
 	window      time.Duration
 	count       int
@@ -15,7 +16,7 @@ type Limiter struct {
 	mu sync.Mutex
 }
 
-func NewLimiter(maxRequests int, window time.Duration) *Limiter {
+func NewFixedWindow(maxRequests int, window time.Duration) *FixedWindow {
 	if maxRequests < 1 {
 		panic("cannot handle maxRequests less than 1")
 	}
@@ -24,13 +25,13 @@ func NewLimiter(maxRequests int, window time.Duration) *Limiter {
 		panic("cannot handle zero or negative window")
 	}
 
-	return &Limiter{
+	return &FixedWindow{
 		maxRequests: maxRequests,
 		window:      window,
 	}
 }
 
-func (l *Limiter) Allow(at time.Time) bool {
+func (l *FixedWindow) Allow(at time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -54,16 +55,17 @@ func (l *Limiter) Allow(at time.Time) bool {
 	return false
 }
 
-type RateLimiter struct {
+// keyed dispatcher
+type FixedWindowLimiter struct {
 	maxRequests int
 	window      time.Duration
 
-	limiters map[string]*Limiter
+	limiters map[string]*FixedWindow
 
 	mu sync.Mutex
 }
 
-func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
+func NewFixedWindowLimiter(maxRequests int, window time.Duration) *FixedWindowLimiter {
 	if maxRequests < 1 {
 		panic("cannot handle maxRequests less than 1")
 	}
@@ -72,25 +74,26 @@ func NewRateLimiter(maxRequests int, window time.Duration) *RateLimiter {
 		panic("cannot handle zero or negative window")
 	}
 
-	return &RateLimiter{
+	return &FixedWindowLimiter{
 		maxRequests: maxRequests,
 		window:      window,
-		limiters:    make(map[string]*Limiter),
+		limiters:    make(map[string]*FixedWindow),
 	}
 }
 
-func (rl *RateLimiter) Allow(key string, at time.Time) bool {
+func (rl *FixedWindowLimiter) Allow(key string, at time.Time) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	limiter, ok := rl.limiters[key]
 	if !ok {
-		limiter = NewLimiter(rl.maxRequests, rl.window)
+		limiter = NewFixedWindow(rl.maxRequests, rl.window)
 		rl.limiters[key] = limiter
 	}
 	return limiter.Allow(at)
 }
 
+// single-key algorithm
 type TokenBucket struct {
 	tokens      int
 	capacity    int
@@ -148,6 +151,7 @@ type Strategy interface {
 
 type StrategyFactory func() Strategy
 
+// keyed dispatcher - default
 type KeyedLimiter struct {
 	strategies map[string]Strategy
 	factory    StrategyFactory
@@ -190,6 +194,7 @@ type StrategyWithInfo interface {
 	Allow(at time.Time) (allowed bool, info Info)
 }
 
+// keyed dispatcher WITH INFO - default
 type KeyedLimiterWithInfo struct {
 	strategies map[string]StrategyWithInfo
 	factory    func() StrategyWithInfo
@@ -223,7 +228,7 @@ func (kl *KeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
 }
 
 type FixedWindowStrategy struct {
-	limiter *Limiter
+	limiter *FixedWindow
 }
 
 func (f *FixedWindowStrategy) Allow(at time.Time) (allowed bool, info Info) {
@@ -246,7 +251,7 @@ var _ StrategyWithInfo = (*FixedWindowStrategy)(nil)
 
 func NewFixedWindowStrategy(maxRequests int, window time.Duration) StrategyWithInfo {
 	return &FixedWindowStrategy{
-		limiter: NewLimiter(maxRequests, window),
+		limiter: NewFixedWindow(maxRequests, window),
 	}
 }
 
