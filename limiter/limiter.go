@@ -221,3 +221,65 @@ func (kl *KeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
 
 	return strategy.Allow(at)
 }
+
+type FixedWindowStrategy struct {
+	limiter *Limiter
+}
+
+func (f *FixedWindowStrategy) Allow(at time.Time) (allowed bool, info Info) {
+	allowed = f.limiter.Allow(at)
+
+	limit := f.limiter.maxRequests
+	remaining := limit - f.limiter.count
+	resetAt := f.limiter.windowStart.Add(f.limiter.window)
+
+	info = Info{
+		Limit:     limit,
+		Remaining: remaining,
+		ResetAt:   resetAt,
+	}
+
+	return allowed, info
+}
+
+var _ StrategyWithInfo = (*FixedWindowStrategy)(nil)
+
+func NewFixedWindowStrategy(maxRequests int, window time.Duration) StrategyWithInfo {
+	return &FixedWindowStrategy{
+		limiter: NewLimiter(maxRequests, window),
+	}
+}
+
+type TokenBucketStrategy struct {
+	limiter *TokenBucket
+}
+
+func (f *TokenBucketStrategy) Allow(at time.Time) (allowed bool, info Info) {
+	allowed = f.limiter.Allow(at)
+
+	limit := f.limiter.capacity
+	remaining := f.limiter.tokens
+
+	var resetAt time.Time
+	if remaining > 0 {
+		resetAt = at
+	} else {
+		resetAt = f.limiter.lastRefill.Add(f.limiter.refillEvery)
+	}
+
+	info = Info{
+		Limit:     limit,
+		Remaining: remaining,
+		ResetAt:   resetAt,
+	}
+
+	return allowed, info
+}
+
+var _ StrategyWithInfo = (*TokenBucketStrategy)(nil)
+
+func NewTokenBucketStrategy(maxTokens int, refillEvery time.Duration) StrategyWithInfo {
+	return &TokenBucketStrategy{
+		limiter: NewTokenBucket(maxTokens, refillEvery),
+	}
+}
