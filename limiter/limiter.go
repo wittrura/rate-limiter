@@ -198,11 +198,13 @@ type StrategyWithInfo interface {
 type entry struct {
 	strategy   StrategyWithInfo
 	lastAccess time.Time
+
+	mu sync.Mutex
 }
 
 // keyed dispatcher WITH INFO - default
 type KeyedLimiterWithInfo struct {
-	entries map[string]entry
+	entries map[string]*entry
 	factory func() StrategyWithInfo
 
 	cleanupTicker *time.Ticker
@@ -219,7 +221,7 @@ func NewKeyedLimiterWithInfo(factory func() StrategyWithInfo) *KeyedLimiterWithI
 
 	return &KeyedLimiterWithInfo{
 		factory: factory,
-		entries: make(map[string]entry),
+		entries: make(map[string]*entry),
 	}
 }
 
@@ -248,7 +250,7 @@ func NewKeyedLimiterWithInfoAndCleanup(factory func() StrategyWithInfo, cfg Clea
 
 	limiter := &KeyedLimiterWithInfo{
 		factory:       factory,
-		entries:       make(map[string]entry),
+		entries:       make(map[string]*entry),
 		cleanupTicker: ticker,
 		cleanupCancel: cancel,
 	}
@@ -276,15 +278,17 @@ func NewKeyedLimiterWithInfoAndCleanup(factory func() StrategyWithInfo, cfg Clea
 
 func (kl *KeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
 	kl.mu.Lock()
-	defer kl.mu.Unlock()
 
 	e, ok := kl.entries[key]
 	if !ok {
-		e = entry{strategy: kl.factory()}
+		e = &entry{strategy: kl.factory()}
 	}
 	e.lastAccess = at
 	kl.entries[key] = e
+	kl.mu.Unlock()
 
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.strategy.Allow(at)
 }
 

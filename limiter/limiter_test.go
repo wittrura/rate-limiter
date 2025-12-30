@@ -1143,3 +1143,179 @@ func TestKeyedLimiterWithInfo_CleanupDoesNotEvictRecentlyUsedKey(t *testing.T) {
 		t.Fatalf("expected key not evicted while active; created=%d", got)
 	}
 }
+
+// blockingStrategyWithInfo can block inside Allow() until released.
+// It also detects concurrent entry into Allow().
+type blockingStrategyWithInfo struct {
+	entered     chan struct{} // closed on first entry into Allow
+	release     chan struct{} // closing releases Allow to return
+	activeCalls int32         // used to detect concurrent entry
+	concurrent  int32         // set to 1 if concurrent entry occurs
+}
+
+func newBlockingStrategyWithInfo() *blockingStrategyWithInfo {
+	return &blockingStrategyWithInfo{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (s *blockingStrategyWithInfo) Allow(at time.Time) (bool, Info) {
+	// Detect concurrent entry.
+	if atomic.AddInt32(&s.activeCalls, 1) != 1 {
+		atomic.StoreInt32(&s.concurrent, 1)
+	}
+	defer atomic.AddInt32(&s.activeCalls, -1)
+
+	// Signal entry exactly once.
+	select {
+	case <-s.entered:
+		// already closed
+	default:
+		close(s.entered)
+	}
+
+	// Block until released.
+	<-s.release
+
+	return true, Info{
+		Limit:     1,
+		Remaining: 0,
+		ResetAt:   at,
+	}
+}
+
+func (s *blockingStrategyWithInfo) releaseNow() {
+	select {
+	case <-s.release:
+		// already closed
+	default:
+		close(s.release)
+	}
+}
+
+func (s *blockingStrategyWithInfo) hasConcurrentEntry() bool {
+	return atomic.LoadInt32(&s.concurrent) == 1
+}
+
+func TestKeyedLimiterWithInfo_DifferentKeysDoNotBlockEachOther(t *testing.T) {
+	t.Parallel()
+
+	// We want a predictable strategy per key:
+	// - key "A" gets a blocking strategy
+	// - key "B" gets a non-blocking strategy
+	blockA := newBlockingStrategyWithInfo()
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		// First created is for key A (in this test), second for key B.
+		n := atomic.AddInt32(&created, 1)
+		if n == 1 {
+			return blockA
+		}
+		// Non-blocking strategy for other keys.
+		return StrategyWithInfoFunc(func(at time.Time) (bool, Info) {
+			return true, Info{Limit: 1, Remaining: 0, ResetAt: at}
+		})
+	}
+
+	kl := NewKeyedLimiterWithInfo(factory)
+
+	at := time.Date(2025, time.December, 10, 9, 0, 0, 0, time.UTC)
+
+	// Start key A; it will block inside strategy.Allow.
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = kl.Allow("A", at)
+	})
+
+	// Wait until key A has actually entered Allow (so we know it's "stuck").
+	select {
+	case <-blockA.entered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for key A to enter strategy.Allow")
+	}
+
+	// Now call key B. If KeyedLimiterWithInfo holds the global map lock
+	// while calling strategy.Allow, this will block behind A and time out.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = kl.Allow("B", at)
+	}()
+
+	select {
+	case <-done:
+		// Good: different key progressed even while A is blocked.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("key B call blocked; expected different keys not to contend on global lock during strategy.Allow")
+	}
+
+	// Unblock A so goroutine can finish cleanly.
+	blockA.releaseNow()
+	wg.Wait()
+}
+
+func TestKeyedLimiterWithInfo_SerializesCallsForSameKey(t *testing.T) {
+	t.Parallel()
+
+	block := newBlockingStrategyWithInfo()
+	factory := func() StrategyWithInfo { return block }
+
+	kl := NewKeyedLimiterWithInfo(factory)
+	at := time.Date(2025, time.December, 10, 9, 10, 0, 0, time.UTC)
+
+	// First call enters and blocks.
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, _ = kl.Allow("same", at)
+	})
+
+	// Ensure first call is inside the strategy.
+	select {
+	case <-block.entered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for first call to enter strategy.Allow")
+	}
+
+	// Second call to same key should NOT enter strategy concurrently.
+	secondEntered := make(chan struct{})
+	go func() {
+		// If implementation is correct, this goroutine will block until we release the first call.
+		_, _ = kl.Allow("same", at)
+		close(secondEntered)
+	}()
+
+	// Give it a moment. If it enters concurrently, our strategy will detect it.
+	time.Sleep(50 * time.Millisecond)
+
+	if block.hasConcurrentEntry() {
+		t.Fatalf("detected concurrent entry into strategy.Allow for the same key; expected per-key serialization")
+	}
+
+	// It also should not have completed yet (because first call still blocked).
+	select {
+	case <-secondEntered:
+		t.Fatalf("second call completed while first call still blocked; expected second call to wait on same key")
+	default:
+		// Good: still blocked.
+	}
+
+	// Release first call; then second should be able to proceed.
+	block.releaseNow()
+
+	select {
+	case <-secondEntered:
+		// ok
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for second call to complete after release")
+	}
+
+	wg.Wait()
+}
+
+// StrategyWithInfoFunc is a small helper for inline strategies in tests.
+// Put it here so we don't have to create new types for tiny behaviors.
+type StrategyWithInfoFunc func(at time.Time) (bool, Info)
+
+func (f StrategyWithInfoFunc) Allow(at time.Time) (bool, Info) { return f(at) }
