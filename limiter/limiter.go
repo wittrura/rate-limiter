@@ -365,3 +365,148 @@ func NewTokenBucketStrategy(maxTokens int, refillEvery time.Duration) StrategyWi
 		limiter: NewTokenBucket(maxTokens, refillEvery),
 	}
 }
+
+type shard struct {
+	entries map[string]*entry
+	sync.Mutex
+}
+
+type ShardedKeyedLimiterWithInfo struct {
+	factory func() StrategyWithInfo
+
+	shards      []*shard
+	shardsCount int
+	hash        func(key string) uint64
+
+	cleanupTicker *time.Ticker
+	cleanupCancel context.CancelFunc
+	isClosed      bool
+
+	sync.Mutex
+}
+
+func NewShardedKeyedLimiterWithInfo(factory func() StrategyWithInfo, shardsCount int, hash func(key string) uint64) *ShardedKeyedLimiterWithInfo {
+	if factory == nil {
+		panic("limiter requires non-nil strategy")
+	}
+
+	if shardsCount < 1 {
+		panic("limiter requires shards >= 1")
+	}
+
+	if hash == nil {
+		panic("limiter requires non-nil hashing function")
+	}
+
+	shards := make([]*shard, shardsCount)
+	for i := range shardsCount {
+		shards[i] = &shard{entries: make(map[string]*entry)}
+	}
+
+	return &ShardedKeyedLimiterWithInfo{
+		factory:     factory,
+		shards:      shards,
+		shardsCount: shardsCount,
+		hash:        hash,
+	}
+}
+
+func NewShardedKeyedLimiterWithInfoAndCleanup(
+	factory func() StrategyWithInfo,
+	shardsCount int,
+	hash func(key string) uint64,
+	cfg CleanupConfig,
+	now func() time.Time,
+) *ShardedKeyedLimiterWithInfo {
+	if factory == nil {
+		panic("limiter requires non-nil strategy")
+	}
+
+	if shardsCount < 1 {
+		panic("limiter requires shards >= 1")
+	}
+
+	if hash == nil {
+		panic("limiter requires non-nil hashing function")
+	}
+
+	if cfg.IdleTTL <= 0 {
+		panic("cleanup requires IdleTTL > 0")
+	}
+	if cfg.CleanupEvery <= 0 {
+		panic("cleanup requires CleanupEvery > 0")
+	}
+	if now == nil {
+		panic("cleanup requires non-nil now() parameter")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(cfg.CleanupEvery)
+
+	shards := make([]*shard, shardsCount)
+	for i := range shardsCount {
+		shards[i] = &shard{entries: make(map[string]*entry)}
+	}
+
+	limiter := &ShardedKeyedLimiterWithInfo{
+		factory:       factory,
+		shards:        shards,
+		shardsCount:   shardsCount,
+		hash:          hash,
+		cleanupTicker: ticker,
+		cleanupCancel: cancel,
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cutoff := now().Add(-cfg.IdleTTL)
+				for _, shard := range limiter.shards {
+					shard.Lock()
+					for key, entry := range shard.entries {
+						if entry.lastAccess.Before(cutoff) {
+							delete(shard.entries, key)
+						}
+					}
+					shard.Unlock()
+				}
+			}
+		}
+	}()
+
+	return limiter
+}
+
+func (kl *ShardedKeyedLimiterWithInfo) Allow(key string, at time.Time) (bool, Info) {
+	shardId := kl.hash(key) % uint64(kl.shardsCount)
+	shard := kl.shards[shardId]
+
+	shard.Lock()
+	e, ok := shard.entries[key]
+	if !ok {
+		e = &entry{strategy: kl.factory()}
+	}
+	e.lastAccess = at
+	shard.entries[key] = e
+	shard.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.strategy.Allow(at)
+}
+
+func (kl *ShardedKeyedLimiterWithInfo) Close() {
+	kl.Lock()
+	defer kl.Unlock()
+
+	if kl.isClosed {
+		return
+	}
+
+	kl.cleanupCancel()
+	kl.cleanupTicker.Stop()
+	kl.isClosed = true
+}

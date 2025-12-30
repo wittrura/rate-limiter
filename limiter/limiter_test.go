@@ -1319,3 +1319,364 @@ func TestKeyedLimiterWithInfo_SerializesCallsForSameKey(t *testing.T) {
 type StrategyWithInfoFunc func(at time.Time) (bool, Info)
 
 func (f StrategyWithInfoFunc) Allow(at time.Time) (bool, Info) { return f(at) }
+
+func TestNewShardedKeyedLimiterWithInfo_PanicsOnInvalidArgs(t *testing.T) {
+	t.Parallel()
+
+	okFactory := func() StrategyWithInfo { return trackingStrategy{} }
+	okHash := func(string) uint64 { return 0 }
+
+	t.Run("nil factory", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic for nil factory")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfo(nil, 8, okHash)
+	})
+
+	t.Run("invalid shard count", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic for shards < 1")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfo(okFactory, 0, okHash)
+	})
+
+	t.Run("nil hash", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic for nil hash")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfo(okFactory, 8, nil)
+	})
+}
+
+func TestShardedKeyedLimiterWithInfo_LazilyCreatesOneStrategyPerKey(t *testing.T) {
+	t.Parallel()
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	// Put everything on shard 0; this test is about correctness, not sharding.
+	hash := func(string) uint64 { return 0 }
+
+	kl := NewShardedKeyedLimiterWithInfo(factory, 4, hash)
+	at := time.Date(2025, time.December, 10, 10, 0, 0, 0, time.UTC)
+
+	_, _ = kl.Allow("a", at)
+	_, _ = kl.Allow("b", at)
+	_, _ = kl.Allow("a", at) // reuse
+
+	if got := atomic.LoadInt32(&created); got != 2 {
+		t.Fatalf("expected exactly 2 strategies created (one per distinct key), got %d", got)
+	}
+}
+
+func TestShardedKeyedLimiterWithInfo_DifferentShardsDoNotBlockOnSlowFactory(t *testing.T) {
+	t.Parallel()
+
+	// The key property of sharding we want:
+	// if one shard is blocked *inside factory creation*, other shards can still proceed.
+
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+
+	var callN int32
+	factory := func() StrategyWithInfo {
+		n := atomic.AddInt32(&callN, 1)
+		if n == 1 {
+			// Block the first creation until the test releases it.
+			close(factoryEntered)
+			<-releaseFactory
+		}
+		return trackingStrategy{}
+	}
+
+	// Deterministic routing: "A" -> shard 0, "B" -> shard 1
+	hash := func(key string) uint64 {
+		if key == "A" {
+			return 0
+		}
+		return 1
+	}
+
+	kl := NewShardedKeyedLimiterWithInfo(factory, 2, hash)
+	at := time.Date(2025, time.December, 10, 10, 10, 0, 0, time.UTC)
+
+	// Start Allow(A) which will block inside factory while holding shard 0 lock.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = kl.Allow("A", at)
+	}()
+
+	// Ensure the first factory call is actually blocked.
+	select {
+	case <-factoryEntered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for factory to be entered for key A")
+	}
+
+	// Now Allow(B) should complete quickly if it hits a different shard lock.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = kl.Allow("B", at)
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("key B was blocked by slow factory on a different shard; expected sharded locks to isolate contention")
+	}
+
+	// Unblock factory so goroutine can finish.
+	close(releaseFactory)
+	wg.Wait()
+}
+
+func TestShardedKeyedLimiterWithInfo_SameShardBlocksOnSlowFactory(t *testing.T) {
+	t.Parallel()
+
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+
+	var callN int32
+	factory := func() StrategyWithInfo {
+		n := atomic.AddInt32(&callN, 1)
+		if n == 1 {
+			close(factoryEntered)
+			<-releaseFactory
+		}
+		return trackingStrategy{}
+	}
+
+	// Force both keys to same shard (0).
+	hash := func(string) uint64 { return 0 }
+
+	kl := NewShardedKeyedLimiterWithInfo(factory, 2, hash)
+	at := time.Date(2025, time.December, 10, 10, 20, 0, 0, time.UTC)
+
+	// Block first key creation inside factory under shard 0 lock.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = kl.Allow("A", at)
+	}()
+
+	select {
+	case <-factoryEntered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for factory to be entered for key A")
+	}
+
+	// Now key B should be blocked, because it goes to the same shard lock.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = kl.Allow("B", at)
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("expected key B to be blocked when routed to the same shard as A")
+	case <-time.After(75 * time.Millisecond):
+		// good: still blocked
+	}
+
+	close(releaseFactory)
+	wg.Wait()
+
+	// After release, B should complete.
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("timed out waiting for key B to complete after releasing factory")
+	}
+}
+
+func TestNewShardedKeyedLimiterWithInfoAndCleanup_PanicsOnInvalidArgs(t *testing.T) {
+	t.Parallel()
+
+	okFactory := func() StrategyWithInfo { return trackingStrategy{} }
+	okHash := func(string) uint64 { return 0 }
+	okNow := func() time.Time { return time.Unix(0, 0) }
+	okCfg := CleanupConfig{IdleTTL: time.Second, CleanupEvery: 10 * time.Millisecond}
+
+	t.Run("nil factory", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("expected panic")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfoAndCleanup(nil, 2, okHash, okCfg, okNow)
+	})
+
+	t.Run("invalid shards", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("expected panic")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfoAndCleanup(okFactory, 0, okHash, okCfg, okNow)
+	})
+
+	t.Run("nil hash", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("expected panic")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfoAndCleanup(okFactory, 2, nil, okCfg, okNow)
+	})
+
+	t.Run("nil now", func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("expected panic")
+			}
+		}()
+		_ = NewShardedKeyedLimiterWithInfoAndCleanup(okFactory, 2, okHash, okCfg, nil)
+	})
+
+	t.Run("invalid cfg", func(t *testing.T) {
+		t.Parallel()
+		bad := []CleanupConfig{
+			{IdleTTL: 0, CleanupEvery: 10 * time.Millisecond},
+			{IdleTTL: -1 * time.Second, CleanupEvery: 10 * time.Millisecond},
+			{IdleTTL: time.Second, CleanupEvery: 0},
+			{IdleTTL: time.Second, CleanupEvery: -1 * time.Millisecond},
+		}
+		for _, cfg := range bad {
+			cfg := cfg
+			t.Run(cfg.IdleTTL.String()+"_"+cfg.CleanupEvery.String(), func(t *testing.T) {
+				t.Parallel()
+				defer func() {
+					if recover() == nil {
+						t.Fatalf("expected panic for cfg=%+v", cfg)
+					}
+				}()
+				_ = NewShardedKeyedLimiterWithInfoAndCleanup(okFactory, 2, okHash, cfg, okNow)
+			})
+		}
+	})
+}
+
+func TestShardedKeyedLimiterWithInfoAndCleanup_EvictsIdleKeysAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2025, time.December, 10, 11, 0, 0, 0, time.UTC)
+	var currentUnix atomic.Int64
+	currentUnix.Store(start.UnixNano())
+	cur := func() time.Time { return time.Unix(0, currentUnix.Load()) }
+	now := func() time.Time { return cur() }
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	// Route keyA -> shard 0, keyB -> shard 1
+	hash := func(key string) uint64 {
+		if key == "A" {
+			return 0
+		}
+		return 1
+	}
+
+	cfg := CleanupConfig{
+		IdleTTL:      50 * time.Millisecond,
+		CleanupEvery: 10 * time.Millisecond,
+	}
+
+	kl := NewShardedKeyedLimiterWithInfoAndCleanup(factory, 2, hash, cfg, now)
+	t.Cleanup(func() { kl.Close() })
+
+	// Touch both keys (two strategies created across two shards).
+	if allowed, _ := kl.Allow("A", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if allowed, _ := kl.Allow("B", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 2 {
+		t.Fatalf("expected 2 strategies created, got %d", got)
+	}
+
+	// Advance time beyond TTL so both should be evicted.
+	currentUnix.Add((200 * time.Millisecond).Nanoseconds())
+	time.Sleep(50 * time.Millisecond)
+
+	// Next uses should recreate both.
+	if allowed, _ := kl.Allow("A", cur()); !allowed {
+		t.Fatalf("expected allowed after eviction")
+	}
+	if allowed, _ := kl.Allow("B", cur()); !allowed {
+		t.Fatalf("expected allowed after eviction")
+	}
+	if got := atomic.LoadInt32(&created); got != 4 {
+		t.Fatalf("expected both keys recreated after eviction; created=%d", got)
+	}
+}
+
+func TestShardedKeyedLimiterWithInfoAndCleanup_CloseStopsCleanup(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2025, time.December, 10, 11, 10, 0, 0, time.UTC)
+	var currentUnix atomic.Int64
+	currentUnix.Store(start.UnixNano())
+	cur := func() time.Time { return time.Unix(0, currentUnix.Load()) }
+	now := func() time.Time { return cur() }
+
+	var created int32
+	factory := func() StrategyWithInfo {
+		atomic.AddInt32(&created, 1)
+		return trackingStrategy{}
+	}
+
+	hash := func(string) uint64 { return 0 }
+	cfg := CleanupConfig{IdleTTL: 50 * time.Millisecond, CleanupEvery: 10 * time.Millisecond}
+
+	kl := NewShardedKeyedLimiterWithInfoAndCleanup(factory, 2, hash, cfg, now)
+
+	// Create key
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected 1 strategy created, got %d", got)
+	}
+
+	// Close twice to ensure idempotence.
+	kl.Close()
+	kl.Close()
+
+	// Advance beyond TTL and wait long enough that cleanup would have run.
+	currentUnix.Add((200 * time.Millisecond).Nanoseconds())
+	time.Sleep(50 * time.Millisecond)
+
+	// If cleanup stopped, entry remains and factory is not called again.
+	if allowed, _ := kl.Allow("user-1", cur()); !allowed {
+		t.Fatalf("expected allowed")
+	}
+	if got := atomic.LoadInt32(&created); got != 1 {
+		t.Fatalf("expected no recreation after Close; created=%d", got)
+	}
+}
